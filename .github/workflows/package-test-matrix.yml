@@ -20,28 +20,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # RHEL-family: official image already ships systemd/sbin/init.
+          # RHEL-family: official image ships systemd already.
           - label: ol8
             image: oraclelinux:8
             pkg: rpm
             needs_systemd_build: false
-          # Debian-family: official images are deliberately minimal and ship
-          # WITHOUT systemd/sbin/init at all -- verified empirically for both.
+            needs_privileged: false
+          # Debian-family: official images ship with no systemd at all.
           - label: debian12
             image: debian:12
             pkg: deb
             needs_systemd_build: true
+            needs_privileged: true
           - label: ubuntu2204
             image: ubuntu:22.04
             pkg: deb
             needs_systemd_build: true
+            needs_privileged: true
     runs-on: ubuntu-latest
     steps:
       - name: Start real PMM Server (published stable release)
         run: |
-          # Recipe matches percona/pmm-qa's own runner-package-test.yml exactly:
-          # PMM_ENABLE_NOMAD=1 needs PMM_PUBLIC_ADDRESS set (per percona/pmm's
-          # documentation/docs/reference/nomad.md) -- no --privileged/--cgroupns needed.
+          # PMM_ENABLE_NOMAD needs PMM_PUBLIC_ADDRESS set, per Percona's docs.
           docker run -d --name pmm-server \
             -p 443:8443 -p 4647:4647 \
             --volume pmm-data:/srv \
@@ -54,43 +54,29 @@ jobs:
 
       - name: Wait for PMM Server readiness
         run: |
-          for i in $(seq 1 60); do
-            code=$(curl -ks -o /dev/null -w "%{http_code}" https://127.0.0.1/v1/server/readyz || true)
-            echo "attempt $i: HTTP $code"
-            [ "$code" = "200" ] && break
-            sleep 5
-          done
-          curl -ks -o /dev/null -w "%{http_code}\n" https://127.0.0.1/v1/server/readyz
+          curl -ksf --retry 60 --retry-delay 5 --retry-all-errors \
+            https://127.0.0.1/v1/server/readyz || true
           docker logs pmm-server --tail 50
 
       - name: Build a systemd-enabled base image (Debian-family only)
         if: matrix.needs_systemd_build == true
         run: |
+          # Bakes in systemd, test tooling, and removes policy-rc.d (which
+          # blocks services from starting on install) before first boot.
           sudo podman run --name client-builder \
             -e DEBIAN_FRONTEND=noninteractive -e NEEDRESTART_MODE=a \
-            ${{ matrix.image }} bash -c "apt-get update && apt-get install -y systemd systemd-sysv dbus sudo"
+            ${{ matrix.image }} bash -c "apt-get update && apt-get install -y systemd systemd-sysv dbus sudo ansible git wget iproute2 procps && rm -f /usr/sbin/policy-rc.d"
           sudo podman commit client-builder ${{ matrix.label }}-systemd
           sudo podman rm -f client-builder
-          echo "CLIENT_IMAGE=${{ matrix.label }}-systemd" >> "$GITHUB_ENV"
-
-      - name: Set client image (RHEL-family - ships with systemd already)
-        if: matrix.needs_systemd_build == false
-        run: echo "CLIENT_IMAGE=${{ matrix.image }}" >> "$GITHUB_ENV"
 
       - name: Start ${{ matrix.label }} client with systemd (podman, host network)
         run: |
-          # --privileged only for the DEB family: several hardened Debian systemd
-          # units (valkey-server, then mysqlrouter -- a systemic pattern, not a
-          # one-off) set PrivateTmp/ProtectSystem, which needs a private mount
-          # namespace and more than just CAP_SYS_ADMIN under Podman's default
-          # seccomp profile. OL8 never needed this (5/5 clean runs without it) and
-          # adding it unconditionally correlated with a new, reproducible MySQL
-          # root-auth failure there (2/2 after) -- so keep it scoped to where it's
-          # actually required rather than blanket-applied.
+          # --privileged: hardened Debian systemd units (valkey-server,
+          # mysqlrouter) need a mount namespace Podman blocks by default.
+          CLIENT_IMAGE="${{ matrix.image }}"
+          [ "${{ matrix.needs_systemd_build }}" = "true" ] && CLIENT_IMAGE="${{ matrix.label }}-systemd"
           EXTRA_FLAGS=""
-          if [ "${{ matrix.pkg }}" = "deb" ]; then
-            EXTRA_FLAGS="--privileged"
-          fi
+          [ "${{ matrix.needs_privileged }}" = "true" ] && EXTRA_FLAGS="--privileged"
           sudo podman run -d --name client --systemd=always ${EXTRA_FLAGS} --network host "${CLIENT_IMAGE}" /sbin/init
           sleep 3
           sudo podman exec client systemctl is-system-running --wait || true
@@ -102,21 +88,6 @@ jobs:
           sudo podman exec client dnf -y update
           sudo podman exec client dnf install -y ansible-core git wget dpkg sudo iproute
 
-      - name: Prepare the client (DEB family - Debian and Ubuntu, mirrors setup_debian_package_tests())
-        if: matrix.pkg == 'deb'
-        run: |
-          # DEBIAN_FRONTEND/NEEDRESTART_MODE avoid an interactive needrestart/debconf
-          # prompt hanging forever -- this container is now booted with systemd as
-          # PID 1, so postinst scripts can genuinely try to restart services.
-          sudo podman exec -e DEBIAN_FRONTEND=noninteractive -e NEEDRESTART_MODE=a \
-            client bash -c "apt-get update && apt-get install -y ansible git wget sudo iproute2 procps"
-          # Debian/Ubuntu's official images ship /usr/sbin/policy-rc.d returning
-          # exit 101, which blocks invoke-rc.d/deb-systemd-helper from starting
-          # ANY service during package install (a Docker-build safety measure).
-          # That silently prevented the pmm-client .deb's postinst from starting
-          # pmm-agent. Remove it so package installs behave like a real VM.
-          sudo podman exec client rm -f /usr/sbin/policy-rc.d
-
       - name: Checkout real percona/pmm-qa package_tests playbook
         run: |
           sudo podman exec client git clone --depth 1 --branch main https://github.com/percona/pmm-qa /root/pmm-qa
@@ -125,15 +96,11 @@ jobs:
         run: |
           docker exec pmm-server supervisorctl status || true
           curl -ks -o /dev/null -w "nomad HTTP %{http_code}\n" https://127.0.0.1/nomad/v1/nodes || true
-          docker logs pmm-server 2>&1 | grep -i nomad || echo "no nomad lines in server log"
 
       - name: Run the real, unmodified pmm3-client_integration.yml playbook
         run: |
-          # DEBIAN_FRONTEND/NEEDRESTART_MODE/TZ here too: the playbook itself runs
-          # apt-get installs internally (pmm-client .deb, percona-valkey-server,
-          # etc.), any of which can pull in tzdata as a fresh dependency and hit
-          # the interactive "select geographic area" debconf prompt if unset --
-          # harmless no-ops on the RPM (OL8) leg.
+          # The playbook's own apt-get installs (pmm-client, valkey, etc.)
+          # need these too, or a fresh tzdata install can hang on a prompt.
           sudo podman exec \
             -e PMM_SERVER_IP=127.0.0.1 \
             -e ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
@@ -156,15 +123,14 @@ jobs:
           echo "::group::client pmm-agent status"
           sudo podman exec client pmm-admin status || true
           echo "::endgroup::"
-          echo "::group::client dbus status (investigating the deb-systemd-invoke flake)"
-          sudo podman exec client systemctl status dbus --no-pager -l || true
-          sudo podman exec client journalctl -u dbus --no-pager -n 200 || true
-          echo "::endgroup::"
-          echo "::group::client valkey-server status"
-          sudo podman exec client systemctl status valkey-server --no-pager -l || true
-          sudo podman exec client journalctl -u valkey-server --no-pager -n 100 || true
-          echo "::endgroup::"
-          echo "::group::client systemd journal around the failure (last 300 lines, all units)"
+          for spec in "dbus:200" "valkey-server:100"; do
+            unit="${spec%%:*}"; n="${spec##*:}"
+            echo "::group::client $unit status"
+            sudo podman exec client systemctl status "$unit" --no-pager -l || true
+            sudo podman exec client journalctl -u "$unit" --no-pager -n "$n" || true
+            echo "::endgroup::"
+          done
+          echo "::group::client systemd journal (last 300 lines)"
           sudo podman exec client journalctl --no-pager -n 300 || true
           echo "::endgroup::"
           echo "::group::client journal (pmm-agent)"

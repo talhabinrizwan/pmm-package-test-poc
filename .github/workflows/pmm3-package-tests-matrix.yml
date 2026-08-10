@@ -184,10 +184,12 @@ jobs:
           NEEDS_PRIVILEGED="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
           PRIV=""
           case " $NEEDS_PRIVILEGED " in *" $OS "*) PRIV="--privileged" ;; esac
-          # Exactly the capability valkey asks for and nothing else. Adding
-          # --security-opt seccomp=unconfined alongside it killed the container
-          # on startup (exit 137), so keep this to the single capability.
-          [ "$OS" = "alma10" ] && PRIV="--cap-add SYS_ADMIN"
+          # alma10 needs the same treatment as the deb family: its valkey@default
+          # unit fails with "Failed to keep CAP_SYS_ADMIN" / status=217/USER
+          # otherwise. --cap-add SYS_ADMIN on its own is NOT a substitute here --
+          # with or without seccomp=unconfined it kills the container at startup
+          # (exit 137), so it gets the full flag like the deb legs do.
+          [ "$OS" = "alma10" ] && PRIV="--privileged"
 
           # Deliberately NOT --network host. PMM asserts that a Nomad node exists
           # whose Address is not 127.0.0.1, so the client must have its own address

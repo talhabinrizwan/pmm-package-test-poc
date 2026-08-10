@@ -157,29 +157,6 @@ jobs:
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
           echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
 
-      - name: Start PMM Server
-        env:
-          SERVER_IMAGE: ${{ needs.prepare.outputs.server_image }}
-          ADMIN_PASSWORD: ${{ inputs.admin_password }}
-        run: |
-          # PMM_ENABLE_NOMAD needs PMM_PUBLIC_ADDRESS as well, or PMM silently
-          # skips starting Nomad (PMM 3.9.0 release notes, PMM-14921).
-          docker run -d --name pmm-server \
-            -p 80:8080 -p 443:8443 -p 9000:9000 -p 4647:4647 \
-            --volume pmm-data:/srv \
-            -e GF_SECURITY_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
-            -e PMM_ENABLE_TELEMETRY=0 \
-            -e PMM_DATA_RETENTION=48h \
-            -e PMM_ENABLE_NOMAD=1 \
-            -e PMM_ENABLE_INTERNAL_PG_QAN=1 \
-            -e PMM_PUBLIC_ADDRESS=127.0.0.1 \
-            "$SERVER_IMAGE"
-
-      - name: Wait for PMM Server to be ready
-        run: |
-          curl -ksf --retry 60 --retry-delay 5 --retry-all-errors \
-            https://127.0.0.1/v1/server/readyz
-
       - name: Start the ${{ matrix.os }} client container
         id: client
         env:
@@ -222,7 +199,40 @@ jobs:
             "ip route get 8.8.8.8 | awk -F'src ' 'NR==1{split(\$2,a,\" \");print a[1]}'" || true)
           echo "client address   : ${client_ip:-<unknown>}"
           echo "server reached at: ${gateway}:443"
-          echo "server_addr=${gateway}:443" >> "$GITHUB_OUTPUT"
+          echo "gateway=${gateway}"          >> "$GITHUB_OUTPUT"
+          echo "server_addr=${gateway}:443"  >> "$GITHUB_OUTPUT"
+
+      # Started AFTER the client, because PMM_PUBLIC_ADDRESS has to be an address
+      # the client can actually reach, and that is the podman bridge gateway --
+      # which only exists once a container has been started on it.
+      - name: Start PMM Server
+        env:
+          SERVER_IMAGE: ${{ needs.prepare.outputs.server_image }}
+          ADMIN_PASSWORD: ${{ inputs.admin_password }}
+          GATEWAY: ${{ steps.client.outputs.gateway }}
+        run: |
+          # PMM_ENABLE_NOMAD needs PMM_PUBLIC_ADDRESS as well, or PMM silently
+          # skips starting Nomad (PMM 3.9.0 release notes, PMM-14921).
+          #
+          # It must NOT be 127.0.0.1 here. The client's Nomad agent dials the
+          # address the server advertises, and from inside the client container
+          # 127.0.0.1 is the client itself -- so nomad_agent sits at "Unspecified"
+          # forever and the playbook's non-local-node assertion fails.
+          docker run -d --name pmm-server \
+            -p 80:8080 -p 443:8443 -p 9000:9000 -p 4647:4647 \
+            --volume pmm-data:/srv \
+            -e GF_SECURITY_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            -e PMM_ENABLE_TELEMETRY=0 \
+            -e PMM_DATA_RETENTION=48h \
+            -e PMM_ENABLE_NOMAD=1 \
+            -e PMM_ENABLE_INTERNAL_PG_QAN=1 \
+            -e PMM_PUBLIC_ADDRESS="$GATEWAY" \
+            "$SERVER_IMAGE"
+
+      - name: Wait for PMM Server to be ready
+        run: |
+          curl -ksf --retry 60 --retry-delay 5 --retry-all-errors \
+            https://127.0.0.1/v1/server/readyz
 
       - name: Check out percona/pmm-qa inside the client
         env:

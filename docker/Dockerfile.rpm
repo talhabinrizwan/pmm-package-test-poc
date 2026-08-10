@@ -14,6 +14,9 @@ FROM ${BASE_IMAGE}
 # EPEL is intentionally NOT installed here. The playbook's own
 # tasks/install_epel.yml sets it up at test time, uniformly across RHEL 8/9/10,
 # which avoids the per-distro epel-release package-name differences.
+# gnupg2 is not optional: Ansible's rpm_key module shells out to `gpg2`, and the
+# playbook uses it to install the EPEL and Percona GPG keys. AlmaLinux 10's base
+# image has no gpg2, which fails the play within the first dozen tasks.
 RUN dnf -y install \
         ansible-core \
         git \
@@ -21,6 +24,7 @@ RUN dnf -y install \
         iproute \
         procps-ng \
         sudo \
+        gnupg2 \
  && dnf clean all \
  && rm -rf /var/cache/dnf
 

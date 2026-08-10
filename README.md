@@ -19,9 +19,13 @@ The two workflows below are the full replacement.
 
 ### 1. `build-test-images.yml` — build the OS images
 
-Builds nine systemd-capable container images and publishes them to GHCR as multi-arch
-(amd64 + arm64) images. Runs **weekly (Mon 02:17 UTC)**, on demand, and on any change
-to `docker/`.
+Builds nine systemd-capable container images and publishes them to GHCR. One job, one
+matrix, nine cells. Runs **weekly (Mon 02:17 UTC)**, on demand, and on any change to
+`docker/`.
+
+amd64 only, deliberately: nothing can consume arm64 images until pmm-server ships an
+arm64 build, and supporting it costs a second build axis plus a manifest-merge job.
+The header comment in the workflow says exactly how to add it back.
 
 Each image is **booted and verified before it is pushed** — systemd must reach
 `running` or `degraded` and the test tooling must be present — so a broken image never
@@ -90,9 +94,13 @@ stages breaks package-manager state and unit symlinks.
 
 ## Maintenance
 
-- **Add or remove an OS**: edit the `os:` list in *both* workflows, and the matching
-  `include:` entry in `build-test-images.yml`. Each file has a comment pointing at the
-  other.
+- **Add or remove an OS**: edit the `include:` list in `build-test-images.yml` and the
+  `os:` list in `pmm3-package-tests-matrix.yml`. Each file has a comment pointing at
+  the other.
+- **The client container has its own network on purpose.** PMM asserts a Nomad node
+  exists whose address is not `127.0.0.1`, so the client must be distinct from the
+  server's own local node. It reaches pmm-server via the podman bridge gateway. Do not
+  "simplify" this back to `--network host`.
 - **Move the images to another org** (e.g. `perconalab`): change the `IMAGE_REPO` /
   `CLIENT_IMAGE_REPO` env value at the top of each workflow.
 - **Bump the default expected version**: edit the `pmm_version` input default, the same

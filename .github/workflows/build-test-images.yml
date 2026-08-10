@@ -1,9 +1,15 @@
 # Builds the nine systemd-capable OS images that the package-test matrix runs
-# against, and publishes them to GHCR as multi-arch (amd64 + arm64) images.
+# against, and publishes them to GHCR.
 #
-# Every image is booted and checked BEFORE it is pushed, so a broken image never
-# becomes :latest. Each OS publishes independently -- one broken OS leaves the
-# other eight untouched, still pointing at last week's good image.
+# Each image is booted and checked BEFORE it is pushed, so a broken image never
+# becomes :latest. Each OS is independent -- one broken OS leaves the other eight
+# pointing at last week's good image.
+#
+# amd64 only, on purpose. Nothing can consume arm64 images until pmm-server ships
+# an arm64 build, and supporting it here costs a second build axis plus a manifest
+# job. To add it back: add `arch: [amd64, arm64]` to the matrix with a `runner`
+# field (ubuntu-latest / ubuntu-24.04-arm), push per-arch tags, and join them with
+# `docker buildx imagetools create`.
 name: Build systemd test images
 
 on:
@@ -17,34 +23,17 @@ on:
       - docker/**
       - .github/workflows/build-test-images.yml
 
-# Least privilege by default; only the jobs that publish ask for more.
 permissions:
   contents: read
 
-# Never let two builds race on the staging tags.
 concurrency:
   group: build-test-images
   cancel-in-progress: false
 
-env:
-  # Change this one line to move the images elsewhere (e.g. ghcr.io/perconalab).
-  IMAGE_REPO: ghcr.io/${{ github.repository }}
-
 jobs:
-  # Resolved once so all 18 build jobs and the 9 manifest jobs agree on the date
-  # tag, even if the run straddles midnight UTC.
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      date: ${{ steps.date.outputs.date }}
-    steps:
-      - id: date
-        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-
   build:
-    name: ${{ matrix.os }} ${{ matrix.arch }}
-    needs: prepare
-    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -52,18 +41,14 @@ jobs:
       attestations: write
     strategy:
       fail-fast: false
-      # 18 runners pushing ~150MB images to GHCR at once trips GHCR's secondary
-      # rate limit (403 permission_denied). Three waves of six is well clear of it
-      # and barely changes wall-clock, since the builds themselves are the slow part.
-      max-parallel: 6
+      # Concurrent pushes of ~150MB images trip GHCR's secondary rate limit.
+      max-parallel: 5
       matrix:
         # KEEP THE OS LIST IN SYNC with .github/workflows/pmm3-package-tests-matrix.yml
-        os: [ol8, ol9, alma10, debian11, debian12, debian13, ubuntu2204, ubuntu2404, ubuntu2604]
-        arch: [amd64, arm64]
+        #
+        # privileged: deb images boot fine unprivileged, but we boot them here
+        # exactly as the test matrix boots them, so this proves the real thing.
         include:
-          # Per-OS settings, applied to both arches of that OS.
-          # privileged: deb-family images boot fine unprivileged, but we boot them
-          # here exactly as the test matrix boots them so this proves the real thing.
           - { os: ol8,        base: 'oraclelinux:8', family: rpm, privileged: false }
           - { os: ol9,        base: 'oraclelinux:9', family: rpm, privileged: false }
           - { os: alma10,     base: 'almalinux:10',  family: rpm, privileged: false }
@@ -73,10 +58,6 @@ jobs:
           - { os: ubuntu2204, base: 'ubuntu:22.04',  family: deb, privileged: true }
           - { os: ubuntu2404, base: 'ubuntu:24.04',  family: deb, privileged: true }
           - { os: ubuntu2604, base: 'ubuntu:26.04',  family: deb, privileged: true }
-          # Per-arch settings, applied to that arch of every OS. Both are native
-          # runners -- no QEMU emulation anywhere.
-          - { arch: amd64, runner: ubuntu-latest }
-          - { arch: arm64, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -115,7 +96,7 @@ jobs:
 
           sudo podman exec probe ansible --version | head -1
           sudo podman exec probe sh -c '
-            for tool in ip ps git wget sudo; do
+            for tool in ip ps git wget sudo gpg2; do
               command -v "$tool" >/dev/null || { echo "missing tool: $tool"; exit 1; }
             done
             echo "test tooling present"'
@@ -127,37 +108,32 @@ jobs:
           GHCR_USER: ${{ github.actor }}
         run: |
           # Both are needed: podman pushes the image, and the attestation action
-          # below reads credentials from ~/.docker/config.json, which only
-          # `docker login` writes.
+          # reads credentials from ~/.docker/config.json, which only docker writes.
           echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-      - name: Push this arch to a staging tag
+      - name: Publish to GHCR
         id: push
         run: |
-          # Staging tags are overwritten every run and are not meant for humans.
-          # The durable artefacts are the multi-arch :<date> and :latest manifests
-          # built in the next job, which reference digests rather than these tags.
-          name="${IMAGE_REPO}/${{ matrix.os }}"
-          sudo podman tag "staged:${{ matrix.os }}" "${name}:staging-${{ matrix.arch }}"
+          name="ghcr.io/${{ github.repository }}/${{ matrix.os }}"
+          sudo podman tag "staged:${{ matrix.os }}" "${name}:latest"
+          sudo podman tag "staged:${{ matrix.os }}" "${name}:$(date -u +%F)"
 
-          # GHCR returns 403 secondary-rate-limit under concurrent pushes; back off
-          # and retry rather than losing the image and failing the OS's manifest.
+          # GHCR returns 403 secondary-rate-limit under concurrent pushes.
           for attempt in 1 2 3 4 5; do
-            if sudo podman push --digestfile=digest.txt "${name}:staging-${{ matrix.arch }}"; then
+            if sudo podman push --digestfile=digest.txt "${name}:latest" \
+               && sudo podman push "${name}:$(date -u +%F)"; then
               break
             fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "push failed after 5 attempts"
-              exit 1
-            fi
+            if [ "$attempt" -eq 5 ]; then echo "push failed after 5 attempts"; exit 1; fi
             echo "push attempt ${attempt} failed; retrying in $((attempt * 20))s"
             sleep "$((attempt * 20))"
           done
 
           sudo chown "$(id -u)" digest.txt
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}"            >> "$GITHUB_OUTPUT"
           echo "digest=$(cat digest.txt)" >> "$GITHUB_OUTPUT"
+          echo "- \`${name}:latest\` \`$(cat digest.txt)\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -165,59 +141,3 @@ jobs:
           subject-name: ${{ steps.push.outputs.name }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
-
-  # Joins each OS's two per-arch images into one multi-arch tag.
-  # if: !cancelled() rather than the default success() so that a single broken OS
-  # fails only its own manifest -- the other eight still publish.
-  manifest:
-    name: publish ${{ matrix.os }}
-    needs: [prepare, build]
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        # KEEP IN SYNC with .github/workflows/pmm3-package-tests-matrix.yml
-        os: [ol8, ol9, alma10, debian11, debian12, debian13, ubuntu2204, ubuntu2404, ubuntu2604]
-    steps:
-      - name: Log in to GHCR
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: docker login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GHCR_TOKEN"
-
-      - name: Join amd64 + arm64 into one multi-arch image
-        env:
-          DATE: ${{ needs.prepare.outputs.date }}
-        run: |
-          # Registry-to-registry manifest merge; nothing is pulled to disk.
-          # Fails loudly if either arch did not publish, which is the point.
-          # Retried for the same GHCR secondary-rate-limit reason as the push.
-          name="${IMAGE_REPO}/${{ matrix.os }}"
-          for attempt in 1 2 3 4 5; do
-            if docker buildx imagetools create \
-                 --tag "${name}:${DATE}" \
-                 --tag "${name}:latest" \
-                 "${name}:staging-amd64" \
-                 "${name}:staging-arm64"; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "manifest create failed after 5 attempts"
-              exit 1
-            fi
-            echo "manifest attempt ${attempt} failed; retrying in $((attempt * 20))s"
-            sleep "$((attempt * 20))"
-          done
-
-          digest=$(docker buildx imagetools inspect "${name}:${DATE}" \
-                     --format '{{ .Manifest.Digest }}')
-          {
-            echo "### \`${{ matrix.os }}\`"
-            echo ''
-            echo "- \`${name}:${DATE}\`"
-            echo "- \`${name}:latest\`"
-            echo "- digest \`${digest}\`"
-          } >> "$GITHUB_STEP_SUMMARY"

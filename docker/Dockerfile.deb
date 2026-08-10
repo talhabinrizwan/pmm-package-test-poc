@@ -39,8 +39,15 @@ RUN apt-get update \
         procps \
         sudo \
         ca-certificates \
+        gnupg2 \
+        dirmngr \
  && rm -f /usr/sbin/policy-rc.d \
  && rm -rf /var/lib/apt/lists/*
+
+# Some playbook tasks call bare `apt install` with no -y (e.g. the Noble
+# percona-release step), which aborts at "Do you want to continue? [Y/n]".
+# DEBIAN_FRONTEND does NOT answer that prompt -- only -y or this does.
+RUN echo 'APT::Get::Assume-Yes "true";' > /etc/apt/apt.conf.d/90assume-yes
 
 # A test fixture never needs a login console, and systemd-getty-generator will
 # happily instantiate a serial-console unit for a device the container does not

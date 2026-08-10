@@ -165,12 +165,13 @@ jobs:
           # PMM_ENABLE_NOMAD needs PMM_PUBLIC_ADDRESS as well, or PMM silently
           # skips starting Nomad (PMM 3.9.0 release notes, PMM-14921).
           docker run -d --name pmm-server \
-            -p 443:8443 -p 4647:4647 \
+            -p 80:8080 -p 443:8443 -p 9000:9000 -p 4647:4647 \
             --volume pmm-data:/srv \
             -e GF_SECURITY_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             -e PMM_ENABLE_TELEMETRY=0 \
             -e PMM_DATA_RETENTION=48h \
             -e PMM_ENABLE_NOMAD=1 \
+            -e PMM_ENABLE_INTERNAL_PG_QAN=1 \
             -e PMM_PUBLIC_ADDRESS=127.0.0.1 \
             "$SERVER_IMAGE"
 
@@ -180,6 +181,7 @@ jobs:
             https://127.0.0.1/v1/server/readyz
 
       - name: Start the ${{ matrix.os }} client container
+        id: client
         env:
           CLIENT_IMAGE: ${{ env.CLIENT_IMAGE_REPO }}/${{ matrix.os }}:${{ inputs.client_image_tag }}
           OS: ${{ matrix.os }}
@@ -191,9 +193,16 @@ jobs:
           NEEDS_PRIVILEGED="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
           PRIV=""
           case " $NEEDS_PRIVILEGED " in *" $OS "*) PRIV="--privileged" ;; esac
+
+          # Deliberately NOT --network host. PMM asserts that a Nomad node exists
+          # whose Address is not 127.0.0.1, so the client must have its own address
+          # distinct from the server's local node. Percona's own CI gets this from a
+          # libvirt VM on 192.168.122.x talking to the server on the bridge gateway;
+          # a podman bridge gives the identical shape for free.
           # shellcheck disable=SC2086
           sudo podman run -d --name client --systemd=always $PRIV \
-            --network host "$CLIENT_IMAGE" /sbin/init
+            "$CLIENT_IMAGE" /sbin/init
+
           sudo podman exec client bash -c '
             for i in $(seq 1 90); do
               case "$(systemctl is-system-running 2>/dev/null)" in
@@ -202,6 +211,12 @@ jobs:
               sleep 1
             done
             echo "client systemd never finished starting"; systemctl list-jobs --no-pager; exit 1'
+
+          # The bridge gateway is the runner, where pmm-server publishes its ports.
+          gateway=$(sudo podman exec client ip route | awk '/^default/{print $3}')
+          echo "client address : $(sudo podman exec client hostname -i)"
+          echo "server reached at: ${gateway}:443"
+          echo "server_addr=${gateway}:443" >> "$GITHUB_OUTPUT"
 
       - name: Check out percona/pmm-qa inside the client
         env:
@@ -217,13 +232,18 @@ jobs:
           METRICS_MODE: ${{ inputs.metrics_mode }}
           PMM_VERSION: ${{ inputs.pmm_version }}
           TARBALL_LINK: ${{ inputs.tarball }}
+          SERVER_ADDR: ${{ steps.client.outputs.server_addr }}
+          # Percona Server has no AlmaLinux 10 release build yet; their own CI
+          # sets this for ol-10 too. Empty everywhere else -> playbook default.
+          PS_REPOSITORY: ${{ matrix.os == 'alma10' && 'testing' || '' }}
         run: |
           set -o pipefail
           # Same invocation Jenkins uses: --connection=local against 127.0.0.1.
           # DEBIAN_FRONTEND/NEEDRESTART_MODE/TZ are baked into the deb images and
           # inherited here, so the playbook's own apt-get calls cannot hang on a prompt.
           sudo podman exec \
-            -e PMM_SERVER_IP=127.0.0.1 \
+            -e PMM_SERVER_IP="$SERVER_ADDR" \
+            -e PS_REPOSITORY="$PS_REPOSITORY" \
             -e ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             -e install_repo="$INSTALL_REPO" \
             -e METRICS_MODE="$METRICS_MODE" \

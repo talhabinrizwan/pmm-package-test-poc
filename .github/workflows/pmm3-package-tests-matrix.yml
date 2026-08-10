@@ -234,6 +234,33 @@ jobs:
           curl -ksf --retry 60 --retry-delay 5 --retry-all-errors \
             https://127.0.0.1/v1/server/readyz
 
+      # readyz goes green before Nomad's listener is up, and the playbook only
+      # retries `pmm-admin list` a handful of times before giving up -- which is
+      # why nomad_agent intermittently sat at "Unspecified". Wait for the listener
+      # here instead, so the client has something to register against immediately.
+      # 502 = gateway up but Nomad not listening yet; 401 = listening.
+      - name: Wait for the server's Nomad to be listening
+        env:
+          GATEWAY: ${{ steps.client.outputs.gateway }}
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -ks -o /dev/null -w '%{http_code}' https://127.0.0.1/nomad/v1/nodes || echo 000)
+            case "$code" in
+              502|000|504) sleep 5 ;;
+              *) echo "nomad listener up after $((i*5))s (HTTP $code)"; break ;;
+            esac
+          done
+          if [ "${code:-502}" = "502" ]; then
+            echo "nomad never started listening on the server"
+            docker logs pmm-server --tail 50 || true
+            exit 1
+          fi
+
+          # And prove the client can actually reach it, since that is the leg that
+          # a wrong PMM_PUBLIC_ADDRESS breaks.
+          sudo podman exec client bash -c \
+            "timeout 5 bash -c '</dev/tcp/${GATEWAY}/4647' && echo 'client can reach ${GATEWAY}:4647'"
+
       - name: Check out percona/pmm-qa inside the client
         env:
           GIT_BRANCH: ${{ inputs.git_branch }}

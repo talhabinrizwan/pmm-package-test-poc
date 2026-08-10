@@ -214,7 +214,13 @@ jobs:
 
           # The bridge gateway is the runner, where pmm-server publishes its ports.
           gateway=$(sudo podman exec client ip route | awk '/^default/{print $3}')
-          echo "client address : $(sudo podman exec client hostname -i)"
+          if [ -z "$gateway" ]; then echo "no default route in the client"; exit 1; fi
+
+          # This is the address the playbook registers with Nomad, so log it: an
+          # empty or loopback value here is the cause of a later Nomad assertion.
+          client_ip=$(sudo podman exec client sh -c \
+            "ip route get 8.8.8.8 | awk -F'src ' 'NR==1{split(\$2,a,\" \");print a[1]}'" || true)
+          echo "client address   : ${client_ip:-<unknown>}"
           echo "server reached at: ${gateway}:443"
           echo "server_addr=${gateway}:443" >> "$GITHUB_OUTPUT"
 

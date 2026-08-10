@@ -163,13 +163,21 @@ jobs:
           CLIENT_IMAGE: ${{ env.CLIENT_IMAGE_REPO }}/${{ matrix.os }}:${{ inputs.client_image_tag }}
           OS: ${{ matrix.os }}
         run: |
-          # Only the deb family needs --privileged: its hardened units
-          # (valkey-server, mysqlrouter) require a private mount namespace.
-          # It stays scoped -- granting it to the RHEL legs too reproducibly
-          # broke `pmm-admin add mysql` there.
-          NEEDS_PRIVILEGED="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
+          # Debian-family hardened units (valkey-server, mysqlrouter) set
+          # PrivateTmp=/ProtectSystem= and need CAP_SYS_ADMIN to build their
+          # private mount namespace.
+          #
+          # This grants that capability directly rather than using --privileged.
+          # --privileged makes podman bind the HOST's cgroup root into the
+          # container, and PMM's Nomad agent then tries to enable controllers
+          # there and dies with EBUSY on cgroup.subtree_control ("cgroups are not
+          # writable"), which is exactly why the deb legs failed the Nomad check
+          # while the unprivileged RHEL legs passed.
+          NEEDS_SYS_ADMIN="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
           PRIV=""
-          case " $NEEDS_PRIVILEGED " in *" $OS "*) PRIV="--privileged" ;; esac
+          case " $NEEDS_SYS_ADMIN " in
+            *" $OS "*) PRIV="--cap-add SYS_ADMIN --security-opt seccomp=unconfined" ;;
+          esac
 
           # Deliberately NOT --network host. PMM asserts that a Nomad node exists
           # whose Address is not 127.0.0.1, so the client must have its own address

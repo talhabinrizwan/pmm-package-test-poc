@@ -184,7 +184,10 @@ jobs:
           NEEDS_PRIVILEGED="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
           PRIV=""
           case " $NEEDS_PRIVILEGED " in *" $OS "*) PRIV="--privileged" ;; esac
-          [ "$OS" = "alma10" ] && PRIV="--cap-add SYS_ADMIN --security-opt seccomp=unconfined"
+          # Exactly the capability valkey asks for and nothing else. Adding
+          # --security-opt seccomp=unconfined alongside it killed the container
+          # on startup (exit 137), so keep this to the single capability.
+          [ "$OS" = "alma10" ] && PRIV="--cap-add SYS_ADMIN"
 
           # Deliberately NOT --network host. PMM asserts that a Nomad node exists
           # whose Address is not 127.0.0.1, so the client must have its own address

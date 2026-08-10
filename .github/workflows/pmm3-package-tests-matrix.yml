@@ -203,23 +203,31 @@ jobs:
           echo "client address   : ${client_ip:-<unknown>}"
           echo "server reached at: ${gateway}:443"
 
-          # PMM's Nomad agent creates /sys/fs/cgroup/nomad and enables controllers
-          # on it. When that fails it exits with "cgroups are not writable" and the
-          # playbook's Nomad assertion fails ~25 minutes later. Run the same
-          # operation here so every cell reports, up front, whether Nomad can work.
-          echo "::group::cgroup readiness"
+          # PMM's Nomad agent enables cgroup controllers on the container's cgroup
+          # root. cgroup v2 forbids that on any cgroup with processes sitting
+          # directly in it, so Nomad exits with "cgroups are not writable" and the
+          # playbook's Nomad assertion fails ~25 minutes later.
+          #
+          # Measured across all nine OSes, this predicted the result exactly:
+          #   0 procs at the cgroup root -> ol8, ol9, debian11  passed
+          #   2 procs at the cgroup root -> debian12/13, ubuntu2204/2404/2604 failed
+          #
+          # Some systemd builds leave a couple of processes in the root instead of
+          # migrating them into init.scope. Move them into a child cgroup so the
+          # root is delegatable. Harmless where the root is already empty.
+          echo "::group::cgroup root"
           sudo podman exec client sh -c '
-            echo "cgroupns  : $(readlink /proc/self/ns/cgroup)"
-            echo "procs at root: $(wc -l < /sys/fs/cgroup/cgroup.procs)"
-            echo "controllers  : $(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null)"
-            echo "subtree_ctl  : $(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null)"
-            if mkdir -p /sys/fs/cgroup/nomad-probe 2>/dev/null &&
-               echo "+cpu +memory" > /sys/fs/cgroup/nomad-probe/cgroup.subtree_control 2>/tmp/cg.err; then
-              echo "NOMAD CGROUP PROBE: OK"
-            else
-              echo "NOMAD CGROUP PROBE: FAILED -> $(cat /tmp/cg.err 2>/dev/null)"
+            before=$(wc -l < /sys/fs/cgroup/cgroup.procs)
+            if [ "$before" -gt 0 ]; then
+              mkdir -p /sys/fs/cgroup/init
+              while read -r pid; do
+                echo "$pid" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true
+              done < /sys/fs/cgroup/cgroup.procs
             fi
-            rmdir /sys/fs/cgroup/nomad-probe 2>/dev/null || true' || true
+            after=$(wc -l < /sys/fs/cgroup/cgroup.procs)
+            echo "cgroup root procs: ${before} -> ${after}"
+            [ "$after" -eq 0 ] && echo "cgroup root delegatable: Nomad can start" \
+                               || echo "WARNING: cgroup root still occupied; Nomad will fail"' || true
           echo "::endgroup::"
           echo "gateway=${gateway}"          >> "$GITHUB_OUTPUT"
           echo "server_addr=${gateway}:443"  >> "$GITHUB_OUTPUT"

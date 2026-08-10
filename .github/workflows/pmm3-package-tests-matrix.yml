@@ -157,6 +157,25 @@ jobs:
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
           echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
 
+      # GitHub runners ship MySQL, so the host AppArmor policy carries a profile
+      # for /usr/sbin/mysqld. AppArmor attaches profiles by binary path, so it
+      # also confines the mysqld running INSIDE our container: the journal shows
+      #   apparmor="DENIED" profile="/usr/sbin/mysqld" name=".../errmsg.sys"
+      # mysqld then cannot write /var/log/mysqld.log, so the playbook's
+      # temporary-password grep returns nothing, the root password is silently
+      # never set, and `pmm-admin add mysql` fails with "Access denied" 25 tasks
+      # later. Under --privileged podman drops the container profile, which is
+      # what lets the host one take over -- the real cause of the long-standing
+      # "privileged breaks pmm-admin add mysql" behaviour on RHEL-family legs.
+      - name: Unload the runner's mysqld AppArmor profile
+        run: |
+          if [ -f /etc/apparmor.d/usr.sbin.mysqld ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.mysqld && echo "profile unloaded"
+          else
+            echo "no host mysqld profile present"
+          fi
+          sudo aa-status 2>/dev/null | grep -c mysqld || true
+
       - name: Start the ${{ matrix.os }} client container
         id: client
         env:

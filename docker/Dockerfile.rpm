@@ -1,0 +1,39 @@
+# Systemd-enabled test fixture for RHEL-family package testing.
+# Used for: Oracle Linux 8, Oracle Linux 9, AlmaLinux 10.
+#
+# DELIBERATELY SINGLE-STAGE. The deliverable here is the OS userspace itself, so
+# there is no build artifact to discard, and copying a systemd install between
+# stages breaks package-manager state, file capabilities and unit symlinks.
+# Please do not "optimise" this into a multi-stage build.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# RHEL-family images already ship systemd as /sbin/init, so we only add the test
+# tooling that Jenkins' setup_rhel_package_tests() installs onto its agents.
+#
+# EPEL is intentionally NOT installed here. The playbook's own
+# tasks/install_epel.yml sets it up at test time, uniformly across RHEL 8/9/10,
+# which avoids the per-distro epel-release package-name differences.
+RUN dnf -y install \
+        ansible-core \
+        git \
+        wget \
+        iproute \
+        procps-ng \
+        sudo \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
+
+# A test fixture never needs a login console, and systemd-getty-generator will
+# happily instantiate a serial-console unit for a device the container does not
+# have -- which blocks multi-user.target forever. Masking these also shaves the
+# boot down to a couple of seconds.
+RUN systemctl mask \
+        getty.target \
+        getty@.service \
+        serial-getty@.service \
+        console-getty.service
+
+# systemd shuts down cleanly on SIGRTMIN+3 (see systemd.io CONTAINER_INTERFACE).
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

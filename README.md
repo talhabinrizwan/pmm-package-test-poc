@@ -49,6 +49,13 @@ Inputs mirror the Jenkins job parameters one-for-one: `pmm_server_image`
 > satisfy it, so operators override there too. `release` ships the latest released
 > version; `experimental`/`testing` ship the in-development one.
 
+> **The two `upgrade` playbooks cannot pass with `install_repo=release`.** They install
+> the old client from the `release` repo and then upgrade to whatever `install_repo`
+> points at, so with `release` both ends are the same version, nothing upgrades, and
+> the run fails with `PMM Agent was not restarted. Old PID is: N New PID is: N`. Run
+> them with `experimental` or `testing` — this is why Jenkins defaults to
+> `experimental`. The other six playbooks are happy either way.
+
 Results land as a pass/fail grid in the run summary. Failed cells attach their full
 `ansible -vvv` output as a `logs-<os>-<test>` artifact.
 

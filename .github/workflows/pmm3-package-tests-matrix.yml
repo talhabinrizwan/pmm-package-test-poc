@@ -1,0 +1,397 @@
+# Full replication of the Jenkins pmm3-package-tests-matrix job on GitHub Actions.
+#
+# Jenkins runs 8 test playbooks x 9 operating systems. Here that is 72 independent
+# cells, each on its own runner with its own PMM Server and its own systemd-capable
+# client container -- the same fresh-VM-per-pair isolation Jenkins gets.
+#
+# The playbook is cloned from percona/pmm-qa and run BYTE-FOR-BYTE as Jenkins runs
+# it. Everything OS-specific lives in the prebuilt client images (built by
+# build-test-images.yml), never in the playbook.
+#
+# The older 3-OS package-test-matrix.yml is kept alongside this as a known-good
+# reference; this workflow supersedes it once all 72 cells are green.
+name: PMM package tests matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Operating system to test ("all" runs every OS)'
+        type: choice
+        default: all
+        options:
+          [all, ol8, ol9, alma10, debian11, debian12, debian13, ubuntu2204, ubuntu2404, ubuntu2604]
+      test:
+        description: 'Playbook to run ("all" runs every test)'
+        type: choice
+        default: all
+        options:
+          - all
+          - pmm3-client_integration
+          - pmm3-client_integration_auth_config
+          - pmm3-client_integration_auth_register
+          - pmm3-client_integration_custom_path
+          - pmm3-client_integration_custom_port
+          - pmm3-client_integration_upgrade
+          - pmm3-client_integration_upgrade_custom_path
+          - pmm3-client_integration_upgrade_custom_port
+      pmm_server_image:
+        description: 'PMM Server image (Jenkins DOCKER_VERSION)'
+        default: 'perconalab/pmm-server:3-dev-latest'
+      install_repo:
+        description: 'Percona repo channel for the client (Jenkins INSTALL_REPO)'
+        type: choice
+        default: experimental
+        options: [experimental, testing, release]
+      pmm_version:
+        description: 'Expected client version, asserted by the playbook (Jenkins PMM_VERSION).
+          Must match what install_repo actually ships, exactly as in Jenkins.'
+        default: '3.9.0'
+      metrics_mode:
+        description: 'Metrics mode (Jenkins METRICS_MODE)'
+        type: choice
+        default: auto
+        options: [auto, push, pull]
+      tarball:
+        description: 'PMM Client tarball link or FB-code (Jenkins TARBALL). Empty = install from packages.'
+        default: ''
+      admin_password:
+        description: 'PMM Server admin password (Jenkins ADMIN_PASSWORD)'
+        default: 'pmm3admin!'
+      git_branch:
+        description: 'Tag/branch of percona/pmm-qa (Jenkins GIT_BRANCH)'
+        default: 'main'
+      client_image_tag:
+        description: 'Tag of the prebuilt client images. Use a YYYY-MM-DD tag to roll back.'
+        default: 'latest'
+
+permissions:
+  contents: read
+
+env:
+  CLIENT_IMAGE_REPO: ghcr.io/${{ github.repository }}
+
+jobs:
+  # Copies PMM Server from Docker Hub into GHCR exactly once per run.
+  #
+  # Two reasons, both real: a 72-cell run would otherwise cost 72 Docker Hub pulls
+  # against a 100-per-6h limit shared across every GitHub runner on that IP; and
+  # pinning one digest means all 72 cells test the SAME server build, which a
+  # moving tag like 3-dev-latest would not otherwise guarantee.
+  prepare:
+    name: mirror pmm-server
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      server_image: ${{ steps.mirror.outputs.image }}
+      source_digest: ${{ steps.mirror.outputs.digest }}
+    steps:
+      - name: Mirror PMM Server into GHCR
+        id: mirror
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          SOURCE: ${{ inputs.pmm_server_image }}
+          DEST: ghcr.io/${{ github.repository }}/pmm-server:run-${{ github.run_id }}
+        run: |
+          digest=$(skopeo inspect --format '{{.Digest}}' "docker://${SOURCE}")
+          skopeo copy --retry-times 3 \
+            --dest-creds "${GHCR_USER}:${GHCR_TOKEN}" \
+            "docker://${SOURCE}" "docker://${DEST}"
+          echo "image=${DEST}"    >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Write run header
+        env:
+          SOURCE: ${{ inputs.pmm_server_image }}
+          DIGEST: ${{ steps.mirror.outputs.digest }}
+        run: |
+          {
+            echo "## PMM package tests matrix"
+            echo ''
+            echo "| setting | value |"
+            echo "|---|---|"
+            echo "| pmm-server | \`${SOURCE}\` |"
+            echo "| resolved digest | \`${DIGEST}\` |"
+            echo "| install_repo | \`${{ inputs.install_repo }}\` |"
+            echo "| pmm_version | \`${{ inputs.pmm_version }}\` |"
+            echo "| metrics_mode | \`${{ inputs.metrics_mode }}\` |"
+            echo "| pmm-qa branch | \`${{ inputs.git_branch }}\` |"
+            echo "| client images | \`${{ inputs.client_image_tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.test }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90 # same as the Jenkins job
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # "all" -> every OS/test; otherwise just the one picked in the Run dialog.
+        #
+        # KEEP THE OS LIST IN SYNC with .github/workflows/build-test-images.yml
+        #
+        # Continuation lines MUST stay at this exact indentation: YAML folds a >-
+        # block into one line only while lines share the base indent. Indent them
+        # further and the newlines survive into the expression.
+        os: >-
+          ${{ fromJSON(inputs.os == 'all'
+          && '["ol8","ol9","alma10","debian11","debian12","debian13","ubuntu2204","ubuntu2404","ubuntu2604"]'
+          || format('["{0}"]', inputs.os)) }}
+        test: >-
+          ${{ fromJSON(inputs.test == 'all'
+          && '["pmm3-client_integration","pmm3-client_integration_auth_config","pmm3-client_integration_auth_register","pmm3-client_integration_custom_path","pmm3-client_integration_custom_port","pmm3-client_integration_upgrade","pmm3-client_integration_upgrade_custom_path","pmm3-client_integration_upgrade_custom_port"]'
+          || format('["{0}"]', inputs.test)) }}
+    steps:
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Start PMM Server
+        env:
+          SERVER_IMAGE: ${{ needs.prepare.outputs.server_image }}
+          ADMIN_PASSWORD: ${{ inputs.admin_password }}
+        run: |
+          # PMM_ENABLE_NOMAD needs PMM_PUBLIC_ADDRESS as well, or PMM silently
+          # skips starting Nomad (PMM 3.9.0 release notes, PMM-14921).
+          docker run -d --name pmm-server \
+            -p 443:8443 -p 4647:4647 \
+            --volume pmm-data:/srv \
+            -e GF_SECURITY_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            -e PMM_ENABLE_TELEMETRY=0 \
+            -e PMM_DATA_RETENTION=48h \
+            -e PMM_ENABLE_NOMAD=1 \
+            -e PMM_PUBLIC_ADDRESS=127.0.0.1 \
+            "$SERVER_IMAGE"
+
+      - name: Wait for PMM Server to be ready
+        run: |
+          curl -ksf --retry 60 --retry-delay 5 --retry-all-errors \
+            https://127.0.0.1/v1/server/readyz
+
+      - name: Start the ${{ matrix.os }} client container
+        env:
+          CLIENT_IMAGE: ${{ env.CLIENT_IMAGE_REPO }}/${{ matrix.os }}:${{ inputs.client_image_tag }}
+          OS: ${{ matrix.os }}
+        run: |
+          # Only the deb family needs --privileged: its hardened units
+          # (valkey-server, mysqlrouter) require a private mount namespace.
+          # It stays scoped -- granting it to the RHEL legs too reproducibly
+          # broke `pmm-admin add mysql` there.
+          NEEDS_PRIVILEGED="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
+          PRIV=""
+          case " $NEEDS_PRIVILEGED " in *" $OS "*) PRIV="--privileged" ;; esac
+          # shellcheck disable=SC2086
+          sudo podman run -d --name client --systemd=always $PRIV \
+            --network host "$CLIENT_IMAGE" /sbin/init
+          sudo podman exec client bash -c '
+            for i in $(seq 1 90); do
+              case "$(systemctl is-system-running 2>/dev/null)" in
+                running|degraded) echo "systemd up (${i}s)"; exit 0 ;;
+              esac
+              sleep 1
+            done
+            echo "client systemd never finished starting"; systemctl list-jobs --no-pager; exit 1'
+
+      - name: Check out percona/pmm-qa inside the client
+        env:
+          GIT_BRANCH: ${{ inputs.git_branch }}
+        run: |
+          sudo podman exec client git clone --depth 1 --branch "$GIT_BRANCH" \
+            https://github.com/percona/pmm-qa /root/pmm-qa
+
+      - name: Run ${{ matrix.test }}
+        env:
+          ADMIN_PASSWORD: ${{ inputs.admin_password }}
+          INSTALL_REPO: ${{ inputs.install_repo }}
+          METRICS_MODE: ${{ inputs.metrics_mode }}
+          PMM_VERSION: ${{ inputs.pmm_version }}
+          TARBALL_LINK: ${{ inputs.tarball }}
+        run: |
+          set -o pipefail
+          # Same invocation Jenkins uses: --connection=local against 127.0.0.1.
+          # DEBIAN_FRONTEND/NEEDRESTART_MODE/TZ are baked into the deb images and
+          # inherited here, so the playbook's own apt-get calls cannot hang on a prompt.
+          sudo podman exec \
+            -e PMM_SERVER_IP=127.0.0.1 \
+            -e ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            -e install_repo="$INSTALL_REPO" \
+            -e METRICS_MODE="$METRICS_MODE" \
+            -e PMM_VERSION="$PMM_VERSION" \
+            -e TARBALL_LINK="$TARBALL_LINK" \
+            -w /root/pmm-qa \
+            client \
+            ansible-playbook -vvv \
+              --connection=local \
+              --inventory 127.0.0.1, \
+              --limit 127.0.0.1 \
+              "package_tests/${{ matrix.test }}.yml" 2>&1 | tee ansible.log
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          {
+            echo "===== pmm-server logs ====="
+            docker logs pmm-server --tail 200 2>&1 || true
+            echo "===== pmm-admin status ====="
+            sudo podman exec client pmm-admin status 2>&1 || true
+            echo "===== failed units ====="
+            sudo podman exec client systemctl --failed --no-pager 2>&1 || true
+            echo "===== client journal ====="
+            sudo podman exec client journalctl --no-pager -n 300 2>&1 || true
+          } > diagnostics.log
+          tail -80 diagnostics.log
+
+      - name: Record cell result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: echo "${{ matrix.os }}|${{ matrix.test }}|${RESULT}" > "result-${{ matrix.os }}-${{ matrix.test }}.txt"
+
+      - name: Upload cell result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: result-${{ matrix.os }}-${{ matrix.test }}
+          path: result-${{ matrix.os }}-${{ matrix.test }}.txt
+          retention-days: 7
+
+      # ansible -vvv is far too large to read in the web log viewer, and it is
+      # exactly what you need to debug a failure.
+      - name: Upload logs from the failed cell
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logs-${{ matrix.os }}-${{ matrix.test }}
+          path: |
+            ansible.log
+            diagnostics.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        run: |
+          sudo podman rm -f client || true
+          docker rm -f pmm-server || true
+
+  report:
+    name: summary
+    needs: [prepare, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download cell results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        # A run where every cell died before reporting leaves nothing to download.
+        # Tolerated here so the next step can fail with a message that says so.
+        continue-on-error: true
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: results
+
+      - name: Render the matrix grid
+        run: |
+          declare -A RESULT SEEN_OS SEEN_TEST
+          for f in results/*.txt; do
+            [ -e "$f" ] || continue
+            IFS='|' read -r os test status < "$f"
+            RESULT["${os}/${test}"]="$status"
+            SEEN_OS["$os"]=1
+            SEEN_TEST["$test"]=1
+          done
+
+          if [ "${#RESULT[@]}" -eq 0 ]; then
+            echo 'No cell results were produced -- every cell failed before reporting.' \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          OS_ORDER="ol8 ol9 alma10 debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
+          TEST_ORDER="pmm3-client_integration \
+                      pmm3-client_integration_auth_config \
+                      pmm3-client_integration_auth_register \
+                      pmm3-client_integration_custom_path \
+                      pmm3-client_integration_custom_port \
+                      pmm3-client_integration_upgrade \
+                      pmm3-client_integration_upgrade_custom_path \
+                      pmm3-client_integration_upgrade_custom_port"
+
+          # Column headers: drop the shared prefix so the table stays readable.
+          header="| OS |"; divider="|---|"
+          for t in $TEST_ORDER; do
+            [ -n "${SEEN_TEST[$t]:-}" ] || continue
+            short="${t#pmm3-client_}"
+            header="${header} ${short} |"; divider="${divider}---|"
+          done
+
+          pass=0; fail=0; other=0
+          body=""
+          for os in $OS_ORDER; do
+            [ -n "${SEEN_OS[$os]:-}" ] || continue
+            row="| \`${os}\` |"
+            for t in $TEST_ORDER; do
+              [ -n "${SEEN_TEST[$t]:-}" ] || continue
+              key="${os}/${t}"
+              case "${RESULT[$key]:-}" in
+                success)   cell='✅'; pass=$((pass+1)) ;;
+                failure)   cell='❌'; fail=$((fail+1)) ;;
+                cancelled) cell='⏹️'; other=$((other+1)) ;;
+                *)         cell='·';  other=$((other+1)) ;;
+              esac
+              row="${row} ${cell} |"
+            done
+            body="${body}${row}"$'\n'
+          done
+
+          # Written with if/fi rather than `cond && cmd`: under `set -e` a trailing
+          # AND-list that evaluates false would fail this step on a fully green run.
+          extra=''
+          if [ "$other" -gt 0 ]; then extra=", ${other} not run"; fi
+
+          {
+            echo ''
+            echo '### Results'
+            echo ''
+            echo "$header"
+            echo "$divider"
+            printf '%s' "$body"
+            echo ''
+            echo "**${pass} passed, ${fail} failed${extra}**"
+            if [ "$fail" -gt 0 ]; then
+              echo ''
+              # shellcheck disable=SC2016  # backticks are markdown here, not a subshell
+              echo 'Logs for each failed cell are attached as `logs-<os>-<test>` artifacts.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$fail" -eq 0 ]
+
+  # Best effort: deleting package versions can require a PAT rather than
+  # GITHUB_TOKEN, so this never fails the run. Worst case, old mirrors linger.
+  prune-mirrors:
+    name: prune old server mirrors
+    needs: [prepare, test, report]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    continue-on-error: true
+    steps:
+      - uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
+        with:
+          owner: ${{ github.repository_owner }}
+          package-name: '${{ github.event.repository.name }}/pmm-server'
+          package-type: container
+          min-versions-to-keep: 3

@@ -170,7 +170,11 @@ jobs:
           #
           # CAP_SYS_ADMIN alone was tried instead and was strictly worse: every
           # deb leg failed, including debian11 which is otherwise reliable.
-          NEEDS_PRIVILEGED="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
+          # alma10 is here too: its valkey@default unit needs CAP_SYS_ADMIN and
+          # fails with "Failed to keep CAP_SYS_ADMIN" / status=217/USER without it.
+          # ol8 and ol9 stay unprivileged -- privileged reproducibly broke
+          # `pmm-admin add mysql` on Oracle Linux.
+          NEEDS_PRIVILEGED="alma10 debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
           PRIV=""
           case " $NEEDS_PRIVILEGED " in *" $OS "*) PRIV="--privileged" ;; esac
 
@@ -324,11 +328,19 @@ jobs:
             -e TARBALL_LINK="$TARBALL_LINK" \
             -w /root/pmm-qa \
             client \
-            ansible-playbook -vvv \
-              --connection=local \
-              --inventory 127.0.0.1, \
-              --limit 127.0.0.1 \
-              "package_tests/${{ matrix.test }}.yml" 2>&1 | tee ansible.log
+            bash -c '
+              # podman exec puts its session in the cgroup ROOT of the container,
+              # and cgroup v2 then refuses to let Nomad enable controllers there
+              # ("cgroups are not writable"). Move this shell -- and therefore
+              # everything the playbook spawns -- into a child cgroup first, so the
+              # root stays empty for the whole run rather than only at boot.
+              mkdir -p /sys/fs/cgroup/ansible 2>/dev/null &&
+                echo $$ > /sys/fs/cgroup/ansible/cgroup.procs 2>/dev/null || true
+              exec ansible-playbook -vvv \
+                --connection=local \
+                --inventory 127.0.0.1, \
+                --limit 127.0.0.1 \
+                "package_tests/${{ matrix.test }}.yml"' 2>&1 | tee ansible.log
 
       - name: Collect diagnostics
         if: failure()

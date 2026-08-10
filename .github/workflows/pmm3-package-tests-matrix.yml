@@ -170,13 +170,21 @@ jobs:
           #
           # CAP_SYS_ADMIN alone was tried instead and was strictly worse: every
           # deb leg failed, including debian11 which is otherwise reliable.
-          # alma10 is here too: its valkey@default unit needs CAP_SYS_ADMIN and
-          # fails with "Failed to keep CAP_SYS_ADMIN" / status=217/USER without it.
-          # ol8 and ol9 stay unprivileged -- privileged reproducibly broke
-          # `pmm-admin add mysql` on Oracle Linux.
-          NEEDS_PRIVILEGED="alma10 debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
+          # Three groups, each for a measured reason:
+          #
+          # deb family  --privileged. Their hardened units (valkey-server,
+          #             mysqlrouter) need a private mount namespace; CAP_SYS_ADMIN
+          #             alone leaves them failing with 226/NAMESPACE.
+          # alma10      CAP_SYS_ADMIN only. Its valkey@default unit asks for exactly
+          #             that ("Failed to keep CAP_SYS_ADMIN", status=217/USER), but
+          #             full --privileged breaks `pmm-admin add mysql` with
+          #             "Access denied for user 'root'@'localhost'" -- the same
+          #             regression already documented on Oracle Linux.
+          # ol8, ol9    nothing. They need neither, and --privileged breaks mysql.
+          NEEDS_PRIVILEGED="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
           PRIV=""
           case " $NEEDS_PRIVILEGED " in *" $OS "*) PRIV="--privileged" ;; esac
+          [ "$OS" = "alma10" ] && PRIV="--cap-add SYS_ADMIN --security-opt seccomp=unconfined"
 
           # Deliberately NOT --network host. PMM asserts that a Nomad node exists
           # whose Address is not 127.0.0.1, so the client must have its own address

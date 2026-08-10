@@ -83,6 +83,24 @@ running, silently and with no error.
 RHEL legs as well reproducibly broke `pmm-admin add mysql` there — so more privilege is
 not automatically safer, and any change here needs re-verifying on every OS.
 
+**The cgroup root must stay empty, or PMM's Nomad agent will not start.** Nomad
+enables cgroup controllers on the container's cgroup root, and cgroup v2 forbids that
+on any cgroup with processes sitting directly in it — the agent exits with `cgroups
+are not writable` and the playbook fails a Nomad assertion ~25 minutes later. Two
+things put processes there: some systemd builds leave a couple behind instead of
+migrating them into `init.scope`, and `podman exec` places its session in the root —
+which matters because the playbook itself runs via `podman exec`. Both are handled:
+the root is drained after boot, and the playbook shell moves itself into a child
+cgroup before running ansible. Measured across all nine OSes, "0 processes at the
+cgroup root" predicted success exactly.
+
+**`--privileged` is about hardened systemd units, not Nomad.** `valkey-server`,
+`mysqlrouter` and AlmaLinux 10's `valkey@default` set `PrivateTmp=`/`ProtectSystem=`
+and need `CAP_SYS_ADMIN` to build a private mount namespace; without it they fail with
+`status=217/USER` or `226/NAMESPACE`. Granting only `CAP_SYS_ADMIN` instead of full
+`--privileged` was tried and is worse. Oracle Linux is deliberately left unprivileged:
+it does not need it, and granting it reproducibly broke `pmm-admin add mysql` there.
+
 **PMM Server is mirrored into GHCR once per run.** A 72-cell run would otherwise cost
 72 Docker Hub pulls against a 100-per-6-hours limit shared with every other GitHub
 runner on that IP. It also pins all 72 cells to one digest, which a moving tag like

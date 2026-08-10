@@ -52,6 +52,10 @@ jobs:
       attestations: write
     strategy:
       fail-fast: false
+      # 18 runners pushing ~150MB images to GHCR at once trips GHCR's secondary
+      # rate limit (403 permission_denied). Three waves of six is well clear of it
+      # and barely changes wall-clock, since the builds themselves are the slow part.
+      max-parallel: 6
       matrix:
         # KEEP THE OS LIST IN SYNC with .github/workflows/pmm3-package-tests-matrix.yml
         os: [ol8, ol9, alma10, debian11, debian12, debian13, ubuntu2204, ubuntu2404, ubuntu2604]
@@ -121,7 +125,12 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
-        run: echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
+        run: |
+          # Both are needed: podman pushes the image, and the attestation action
+          # below reads credentials from ~/.docker/config.json, which only
+          # `docker login` writes.
+          echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
       - name: Push this arch to a staging tag
         id: push
@@ -131,7 +140,21 @@ jobs:
           # built in the next job, which reference digests rather than these tags.
           name="${IMAGE_REPO}/${{ matrix.os }}"
           sudo podman tag "staged:${{ matrix.os }}" "${name}:staging-${{ matrix.arch }}"
-          sudo podman push --digestfile=digest.txt "${name}:staging-${{ matrix.arch }}"
+
+          # GHCR returns 403 secondary-rate-limit under concurrent pushes; back off
+          # and retry rather than losing the image and failing the OS's manifest.
+          for attempt in 1 2 3 4 5; do
+            if sudo podman push --digestfile=digest.txt "${name}:staging-${{ matrix.arch }}"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "push failed after 5 attempts"
+              exit 1
+            fi
+            echo "push attempt ${attempt} failed; retrying in $((attempt * 20))s"
+            sleep "$((attempt * 20))"
+          done
+
           sudo chown "$(id -u)" digest.txt
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           echo "digest=$(cat digest.txt)" >> "$GITHUB_OUTPUT"
@@ -171,12 +194,23 @@ jobs:
         run: |
           # Registry-to-registry manifest merge; nothing is pulled to disk.
           # Fails loudly if either arch did not publish, which is the point.
+          # Retried for the same GHCR secondary-rate-limit reason as the push.
           name="${IMAGE_REPO}/${{ matrix.os }}"
-          docker buildx imagetools create \
-            --tag "${name}:${DATE}" \
-            --tag "${name}:latest" \
-            "${name}:staging-amd64" \
-            "${name}:staging-arm64"
+          for attempt in 1 2 3 4 5; do
+            if docker buildx imagetools create \
+                 --tag "${name}:${DATE}" \
+                 --tag "${name}:latest" \
+                 "${name}:staging-amd64" \
+                 "${name}:staging-arm64"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "manifest create failed after 5 attempts"
+              exit 1
+            fi
+            echo "manifest attempt ${attempt} failed; retrying in $((attempt * 20))s"
+            sleep "$((attempt * 20))"
+          done
 
           digest=$(docker buildx imagetools inspect "${name}:${DATE}" \
                      --format '{{ .Manifest.Digest }}')

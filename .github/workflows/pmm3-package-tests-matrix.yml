@@ -163,21 +163,16 @@ jobs:
           CLIENT_IMAGE: ${{ env.CLIENT_IMAGE_REPO }}/${{ matrix.os }}:${{ inputs.client_image_tag }}
           OS: ${{ matrix.os }}
         run: |
-          # Debian-family hardened units (valkey-server, mysqlrouter) set
-          # PrivateTmp=/ProtectSystem= and need CAP_SYS_ADMIN to build their
-          # private mount namespace.
+          # Only the deb family needs --privileged: its hardened units
+          # (valkey-server, mysqlrouter) require a private mount namespace.
+          # It stays scoped -- granting it to the RHEL legs too reproducibly
+          # broke `pmm-admin add mysql` there.
           #
-          # This grants that capability directly rather than using --privileged.
-          # --privileged makes podman bind the HOST's cgroup root into the
-          # container, and PMM's Nomad agent then tries to enable controllers
-          # there and dies with EBUSY on cgroup.subtree_control ("cgroups are not
-          # writable"), which is exactly why the deb legs failed the Nomad check
-          # while the unprivileged RHEL legs passed.
-          NEEDS_SYS_ADMIN="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
+          # CAP_SYS_ADMIN alone was tried instead and was strictly worse: every
+          # deb leg failed, including debian11 which is otherwise reliable.
+          NEEDS_PRIVILEGED="debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
           PRIV=""
-          case " $NEEDS_SYS_ADMIN " in
-            *" $OS "*) PRIV="--cap-add SYS_ADMIN --security-opt seccomp=unconfined" ;;
-          esac
+          case " $NEEDS_PRIVILEGED " in *" $OS "*) PRIV="--privileged" ;; esac
 
           # Deliberately NOT --network host. PMM asserts that a Nomad node exists
           # whose Address is not 127.0.0.1, so the client must have its own address
@@ -207,6 +202,25 @@ jobs:
             "ip route get 8.8.8.8 | awk -F'src ' 'NR==1{split(\$2,a,\" \");print a[1]}'" || true)
           echo "client address   : ${client_ip:-<unknown>}"
           echo "server reached at: ${gateway}:443"
+
+          # PMM's Nomad agent creates /sys/fs/cgroup/nomad and enables controllers
+          # on it. When that fails it exits with "cgroups are not writable" and the
+          # playbook's Nomad assertion fails ~25 minutes later. Run the same
+          # operation here so every cell reports, up front, whether Nomad can work.
+          echo "::group::cgroup readiness"
+          sudo podman exec client sh -c '
+            echo "cgroupns  : $(readlink /proc/self/ns/cgroup)"
+            echo "procs at root: $(wc -l < /sys/fs/cgroup/cgroup.procs)"
+            echo "controllers  : $(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null)"
+            echo "subtree_ctl  : $(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null)"
+            if mkdir -p /sys/fs/cgroup/nomad-probe 2>/dev/null &&
+               echo "+cpu +memory" > /sys/fs/cgroup/nomad-probe/cgroup.subtree_control 2>/tmp/cg.err; then
+              echo "NOMAD CGROUP PROBE: OK"
+            else
+              echo "NOMAD CGROUP PROBE: FAILED -> $(cat /tmp/cg.err 2>/dev/null)"
+            fi
+            rmdir /sys/fs/cgroup/nomad-probe 2>/dev/null || true' || true
+          echo "::endgroup::"
           echo "gateway=${gateway}"          >> "$GITHUB_OUTPUT"
           echo "server_addr=${gateway}:443"  >> "$GITHUB_OUTPUT"
 

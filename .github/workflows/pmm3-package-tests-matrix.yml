@@ -148,7 +148,17 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
         run: |
-          echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
+          # GHCR answers 403 now and then when all 72 cells authenticate at once,
+          # which otherwise loses the whole cell on its first step.
+          for attempt in 1 2 3 4 5; do
+            if echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin; then
+              exit 0
+            fi
+            echo "login failed, retrying in $((attempt * 10))s"
+            sleep "$((attempt * 10))"
+          done
+          echo "could not log in to GHCR after 5 attempts"
+          exit 1
 
       # Runners come with MySQL installed, and AppArmor matches profiles by binary
       # path -- so the host profile also confines the mysqld in our container and

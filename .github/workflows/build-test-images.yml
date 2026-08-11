@@ -100,13 +100,13 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
         run: |
-          # Twice on purpose. The push runs as root, so it needs root's auth file.
-          # The attestation action runs as the runner user and looks for credentials
-          # in ~/.docker/config.json, which podman can write with --authfile.
+          # Twice on purpose, and the second one is docker for a reason: it runs no
+          # container, it only leaves credentials in ~/.docker/config.json, which is
+          # where the attestation action looks. Rootless podman cannot write that
+          # file here -- it has no usable runtime dir on the runner -- and sudo
+          # podman would put it out of reach of the action, which runs as the user.
           echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
-          mkdir -p "$HOME/.docker"
-          echo "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin \
-            --authfile "$HOME/.docker/config.json"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
       - name: Publish
         id: push

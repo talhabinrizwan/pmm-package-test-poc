@@ -100,10 +100,13 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
         run: |
-          # podman pushes the image; the attestation action reads credentials from
-          # ~/.docker/config.json, which only docker login writes.
+          # Twice on purpose. The push runs as root, so it needs root's auth file.
+          # The attestation action runs as the runner user and looks for credentials
+          # in ~/.docker/config.json, which podman can write with --authfile.
           echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          mkdir -p "$HOME/.docker"
+          echo "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin \
+            --authfile "$HOME/.docker/config.json"
 
       - name: Publish
         id: push

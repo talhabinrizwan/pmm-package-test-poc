@@ -80,33 +80,39 @@ jobs:
     outputs:
       server_image: ${{ steps.mirror.outputs.image }}
     steps:
-      - name: Mirror pmm-server and write the run header
+      - name: Mirror pmm-server into GHCR
         id: mirror
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
           SOURCE: ${{ inputs.pmm_server_image }}
           DEST: ghcr.io/${{ github.repository }}/pmm-server:run-${{ github.run_id }}
-          # Passed as env, not interpolated below: the heredoc is unquoted, so a
-          # value containing $(...) would otherwise be executed.
+        run: |
+          digest=$(skopeo inspect --format '{{.Digest}}' "docker://${SOURCE}")
+          skopeo copy --retry-times 3 --dest-creds "${GHCR_USER}:${GHCR_TOKEN}" \
+            "docker://${SOURCE}" "docker://${DEST}"
+          echo "image=${DEST}"    >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Record what this run is testing
+        env:
+          # Passed as env rather than interpolated into the heredoc below, which is
+          # unquoted and would otherwise execute a value containing $(...).
+          SOURCE: ${{ inputs.pmm_server_image }}
+          DIGEST: ${{ steps.mirror.outputs.digest }}
           REPO: ${{ inputs.install_repo }}
           VERSION: ${{ inputs.pmm_version }}
           METRICS: ${{ inputs.metrics_mode }}
           BRANCH: ${{ inputs.git_branch }}
           IMAGES: ${{ inputs.client_image_tag }}
         run: |
-          digest=$(skopeo inspect --format '{{.Digest}}' "docker://${SOURCE}")
-          skopeo copy --retry-times 3 --dest-creds "${GHCR_USER}:${GHCR_TOKEN}" \
-            "docker://${SOURCE}" "docker://${DEST}"
-          echo "image=${DEST}" >> "$GITHUB_OUTPUT"
-
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           ## PMM package tests matrix
 
           | setting | value |
           |---|---|
           | pmm-server | \`${SOURCE}\` |
-          | resolved digest | \`${digest}\` |
+          | resolved digest | \`${DIGEST}\` |
           | install_repo | \`${REPO}\` |
           | pmm_version | \`${VERSION}\` |
           | metrics_mode | \`${METRICS}\` |
@@ -378,47 +384,45 @@ jobs:
             exit 1
           fi
 
-          all_os="ol8 ol9 ol10 debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
-          all_tests="pmm3-client_integration pmm3-client_integration_auth_config
-                     pmm3-client_integration_auth_register pmm3-client_integration_custom_path
-                     pmm3-client_integration_custom_port pmm3-client_integration_upgrade
-                     pmm3-client_integration_upgrade_custom_path pmm3-client_integration_upgrade_custom_port"
-
-          # Only show the rows and columns that ran, so a filtered run stays small.
-          ran_os()   { for k in "${!result[@]}"; do [ "${k%%/*}" = "$1" ] && return 0; done; return 1; }
-          ran_test() { for k in "${!result[@]}"; do [ "${k#*/}"  = "$1" ] && return 0; done; return 1; }
+          # Rows and columns come from what actually ran, so a filtered run gets a
+          # small table and there is no OS or playbook list to keep in sync here.
+          # -V keeps ol8 before ol10; the playbook names already sort correctly.
+          oses=$(printf '%s\n' "${!result[@]}" | cut -d/ -f1 | sort -uV)
+          tests=$(printf '%s\n' "${!result[@]}" | cut -d/ -f2 | sort -u)
 
           header="| OS |"; divider="|---|"
-          for t in $all_tests; do
-            ran_test "$t" || continue
+          for t in $tests; do
             header+=" ${t#pmm3-client_} |"
             divider+="---|"
           done
 
-          passed=0; failed=0; skipped=0; body=""
-          for os in $all_os; do
-            ran_os "$os" || continue
+          passed=0; failed=0; missing=0; body=""
+          for os in $oses; do
             row="| \`$os\` |"
-            for t in $all_tests; do
-              ran_test "$t" || continue
+            for t in $tests; do
               case "${result[$os/$t]:-}" in
                 success) row+=" ✅ |"; passed=$((passed + 1)) ;;
                 failure) row+=" ❌ |"; failed=$((failed + 1)) ;;
-                *)       row+=" · |";  skipped=$((skipped + 1)) ;;
+                *)       row+=" · |";  missing=$((missing + 1)) ;;
               esac
             done
             body+="$row"$'\n'
           done
 
-          # if/fi rather than `test && echo`: a trailing false would fail the step.
           note=''
-          if [ "$skipped" -gt 0 ]; then note=", ${skipped} not run"; fi
+          if [ "$missing" -gt 0 ]; then note=", ${missing} not run"; fi
 
           {
-            printf '\n### Results\n\n%s\n%s\n%s\n' "$header" "$divider" "$body"
+            echo
+            echo '### Results'
+            echo
+            echo "$header"
+            echo "$divider"
+            printf '%s' "$body"
+            echo
             echo "**${passed} passed, ${failed} failed${note}**"
             if [ "$failed" -gt 0 ]; then
-              echo ''
+              echo
               # shellcheck disable=SC2016  # backticks are markdown, not a subshell
               echo 'Failed cells attach their logs as `logs-<os>-<test>` artifacts.'
             fi

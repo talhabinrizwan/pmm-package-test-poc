@@ -1,21 +1,15 @@
-# Builds the nine systemd-capable OS images that the package-test matrix runs
-# against, and publishes them to GHCR.
+# Builds the nine systemd-capable OS images the package tests run against and
+# publishes them to GHCR. Each image is booted and checked before it is pushed,
+# so a broken image never becomes :latest.
 #
-# Each image is booted and checked BEFORE it is pushed, so a broken image never
-# becomes :latest. Each OS is independent -- one broken OS leaves the other eight
-# pointing at last week's good image.
-#
-# amd64 only, on purpose. Nothing can consume arm64 images until pmm-server ships
-# an arm64 build, and supporting it here costs a second build axis plus a manifest
-# job. To add it back: add `arch: [amd64, arm64]` to the matrix with a `runner`
-# field (ubuntu-latest / ubuntu-24.04-arm), push per-arch tags, and join them with
-# `docker buildx imagetools create`.
+# amd64 only: nothing can use arm64 images until pmm-server ships an arm64 build.
+# To add it, give the matrix an `arch` axis with a `runner` per arch, push one tag
+# each, and join them with `docker buildx imagetools create`.
 name: Build systemd test images
 
 on:
-  # Weekly. Off-the-hour on purpose: GitHub delays the flood of on-the-hour crons.
   schedule:
-    - cron: '17 2 * * 1'
+    - cron: '17 2 * * 1' # Mondays, off the hour so we are not queued behind the crowd
   workflow_dispatch:
   push:
     branches: [main]
@@ -37,21 +31,19 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write # keyless signing for the provenance attestation
+      id-token: write
       attestations: write
     strategy:
       fail-fast: false
-      # Concurrent pushes of ~150MB images trip GHCR's secondary rate limit.
-      max-parallel: 5
+      max-parallel: 5 # more than this and GHCR starts rejecting the pushes
       matrix:
-        # KEEP THE OS LIST IN SYNC with .github/workflows/pmm3-package-tests-matrix.yml
-        #
-        # privileged: deb images boot fine unprivileged, but we boot them here
-        # exactly as the test matrix boots them, so this proves the real thing.
+        # Keep this list in sync with pmm3-package-tests-matrix.yml.
+        # privileged: matches how the test matrix runs each image, so the check here
+        # reflects the real thing.
         include:
           - { os: ol8,        base: 'oraclelinux:8', family: rpm, privileged: false }
           - { os: ol9,        base: 'oraclelinux:9', family: rpm, privileged: false }
-          - { os: alma10,     base: 'almalinux:10',  family: rpm, privileged: false }
+          - { os: alma10,     base: 'almalinux:10',  family: rpm, privileged: true }
           - { os: debian11,   base: 'debian:11',     family: deb, privileged: true }
           - { os: debian12,   base: 'debian:12',     family: deb, privileged: true }
           - { os: debian13,   base: 'debian:13',     family: deb, privileged: true }
@@ -63,17 +55,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build image
+      # sudo everywhere: rootless and root podman have separate image stores, so a
+      # rootless build would be invisible to the root-run container below.
+      - name: Build the image
         run: |
-          # sudo throughout: rootless podman and root podman keep separate image
-          # stores, so a rootless build would be invisible to the root-run probe.
           sudo podman build \
             --file "docker/Dockerfile.${{ matrix.family }}" \
             --build-arg "BASE_IMAGE=${{ matrix.base }}" \
             --tag "staged:${{ matrix.os }}" \
             .
 
-      - name: Boot it and verify systemd actually comes up
+      - name: Boot it and check systemd comes up
         env:
           PRIVILEGED: ${{ matrix.privileged }}
         run: |
@@ -85,21 +77,22 @@ jobs:
           sudo podman exec probe bash -c '
             for i in $(seq 1 90); do
               state=$(systemctl is-system-running 2>/dev/null)
-              case "$state" in
-                running|degraded) echo "systemd reached: $state (${i}s)"; exit 0 ;;
-              esac
+              case "$state" in running|degraded) break ;; esac
               sleep 1
             done
-            echo "systemd never finished starting; last state: $state"
-            systemctl list-jobs --no-pager
-            exit 1'
 
-          sudo podman exec probe ansible --version | head -1
-          sudo podman exec probe sh -c '
-            for tool in ip ps git wget sudo gpg2; do
-              command -v "$tool" >/dev/null || { echo "missing tool: $tool"; exit 1; }
+            case "$state" in
+              running|degraded) echo "systemd is $state after ${i}s" ;;
+              *) echo "systemd never came up (last state: $state)"
+                 systemctl list-jobs --no-pager
+                 exit 1 ;;
+            esac
+
+            for tool in ip ps git wget sudo gpg2 ansible; do
+              command -v "$tool" >/dev/null || { echo "missing: $tool"; exit 1; }
             done
-            echo "test tooling present"'
+            ansible --version | head -1'
+
           sudo podman rm -f probe
 
       - name: Log in to GHCR
@@ -107,33 +100,36 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
         run: |
-          # Both are needed: podman pushes the image, and the attestation action
-          # reads credentials from ~/.docker/config.json, which only docker writes.
+          # podman pushes the image; the attestation action reads credentials from
+          # ~/.docker/config.json, which only docker login writes.
           echo "$GHCR_TOKEN" | sudo podman login ghcr.io -u "$GHCR_USER" --password-stdin
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-      - name: Publish to GHCR
+      - name: Publish
         id: push
         run: |
           name="ghcr.io/${{ github.repository }}/${{ matrix.os }}"
-          sudo podman tag "staged:${{ matrix.os }}" "${name}:latest"
-          sudo podman tag "staged:${{ matrix.os }}" "${name}:$(date -u +%F)"
+          today=$(date -u +%F)
 
-          # GHCR returns 403 secondary-rate-limit under concurrent pushes.
+          sudo podman tag "staged:${{ matrix.os }}" "${name}:latest"
+          sudo podman tag "staged:${{ matrix.os }}" "${name}:${today}"
+
+          # GHCR rate-limits concurrent pushes, so back off and try again.
           for attempt in 1 2 3 4 5; do
             if sudo podman push --digestfile=digest.txt "${name}:latest" \
-               && sudo podman push "${name}:$(date -u +%F)"; then
+               && sudo podman push "${name}:${today}"; then
               break
             fi
-            if [ "$attempt" -eq 5 ]; then echo "push failed after 5 attempts"; exit 1; fi
-            echo "push attempt ${attempt} failed; retrying in $((attempt * 20))s"
+            [ "$attempt" -lt 5 ] || { echo "push failed after 5 attempts"; exit 1; }
+            echo "push failed, retrying in $((attempt * 20))s"
             sleep "$((attempt * 20))"
           done
 
           sudo chown "$(id -u)" digest.txt
-          echo "name=${name}"            >> "$GITHUB_OUTPUT"
-          echo "digest=$(cat digest.txt)" >> "$GITHUB_OUTPUT"
-          echo "- \`${name}:latest\` \`$(cat digest.txt)\`" >> "$GITHUB_STEP_SUMMARY"
+          digest=$(cat digest.txt)
+          echo "name=${name}"     >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "- \`${name}:latest\` \`${digest}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

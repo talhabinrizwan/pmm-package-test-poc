@@ -14,7 +14,7 @@ on:
         type: choice
         default: all
         options:
-          [all, ol8, ol9, alma10, debian11, debian12, debian13, ubuntu2204, ubuntu2404, ubuntu2604]
+          [all, ol8, ol9, ol10, debian11, debian12, debian13, ubuntu2204, ubuntu2404, ubuntu2604]
       test:
         description: 'Playbook ("all" runs every test)'
         type: choice
@@ -129,7 +129,7 @@ jobs:
         # block onto one line while every line shares the same indent.
         os: >-
           ${{ fromJSON(inputs.os == 'all'
-          && '["ol8","ol9","alma10","debian11","debian12","debian13","ubuntu2204","ubuntu2404","ubuntu2604"]'
+          && '["ol8","ol9","ol10","debian11","debian12","debian13","ubuntu2204","ubuntu2404","ubuntu2604"]'
           || format('["{0}"]', inputs.os)) }}
         test: >-
           ${{ fromJSON(inputs.test == 'all'
@@ -159,14 +159,24 @@ jobs:
         id: client
         env:
           CLIENT_IMAGE: ${{ env.CLIENT_IMAGE_REPO }}/${{ matrix.os }}:${{ inputs.client_image_tag }}
+          OS: ${{ matrix.os }}
         run: |
           # Hardened units (valkey-server, mysqlrouter, valkey@default) need a
           # private mount namespace, and CAP_SYS_ADMIN on its own is not enough.
           #
+          # ol8 and ol9 are deliberately left out. Running them privileged was tried
+          # again after the AppArmor fix and still fails, now in a different place:
+          # sudo stops working inside the container ("PAM account management error:
+          # Authentication service cannot retrieve authentication info") and the
+          # play dies at Change Postgresql Password.
+          NEEDS_PRIVILEGED="ol10 debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
+          PRIV=""
+          case " $NEEDS_PRIVILEGED " in *" $OS "*) PRIV="--privileged" ;; esac
+
           # Not --network host: PMM checks for a Nomad node whose address is not
           # 127.0.0.1, so the client needs an address of its own.
-          sudo podman run -d --name client --systemd=always --privileged \
-            "$CLIENT_IMAGE" /sbin/init
+          # shellcheck disable=SC2086
+          sudo podman run -d --name client --systemd=always $PRIV "$CLIENT_IMAGE" /sbin/init
 
           sudo podman exec client bash -c '
             for i in $(seq 1 90); do
@@ -257,9 +267,9 @@ jobs:
           PMM_VERSION: ${{ inputs.pmm_version }}
           TARBALL_LINK: ${{ inputs.tarball }}
           SERVER_ADDR: ${{ steps.client.outputs.gateway }}:443
-          # Percona Server has no AlmaLinux 10 release build yet. Empty elsewhere,
+          # Percona Server has no el10 release build yet. Empty elsewhere,
           # which leaves the playbook on its own default.
-          PS_REPOSITORY: ${{ matrix.os == 'alma10' && 'testing' || '' }}
+          PS_REPOSITORY: ${{ matrix.os == 'ol10' && 'testing' || '' }}
         run: |
           set -o pipefail
           # Same invocation as Jenkins. DEBIAN_FRONTEND and friends are baked into
@@ -357,7 +367,7 @@ jobs:
             exit 1
           fi
 
-          all_os="ol8 ol9 alma10 debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
+          all_os="ol8 ol9 ol10 debian11 debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604"
           all_tests="pmm3-client_integration pmm3-client_integration_auth_config
                      pmm3-client_integration_auth_register pmm3-client_integration_custom_path
                      pmm3-client_integration_custom_port pmm3-client_integration_upgrade

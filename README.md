@@ -65,7 +65,7 @@ Results land as a pass/fail grid in the run summary. Failed cells attach their f
 |---|---|---|---|
 | `ol8` | rpm | `oraclelinux:8` | no |
 | `ol9` | rpm | `oraclelinux:9` | no |
-| `alma10` | rpm | `almalinux:10` | no |
+| `ol10` | rpm | `oraclelinux:10` | yes |
 | `debian11` | deb | `debian:11` | yes |
 | `debian12` | deb | `debian:12` | yes |
 | `debian13` | deb | `debian:13` | yes |
@@ -85,11 +85,6 @@ from starting on install. `docker/Dockerfile.deb` therefore installs systemd and
 removes `/usr/sbin/policy-rc.d`, which otherwise leaves services "enabled" but never
 running, silently and with no error.
 
-**`--privileged` is scoped to the deb family only.** Its hardened units
-(`valkey-server`, `mysqlrouter`) need a private mount namespace. Granting it to the
-RHEL legs as well reproducibly broke `pmm-admin add mysql` there — so more privilege is
-not automatically safer, and any change here needs re-verifying on every OS.
-
 **The cgroup root must stay empty, or PMM's Nomad agent will not start.** Nomad
 enables cgroup controllers on the container's cgroup root, and cgroup v2 forbids that
 on any cgroup with processes sitting directly in it — the agent exits with `cgroups
@@ -102,11 +97,18 @@ cgroup before running ansible. Measured across all nine OSes, "0 processes at th
 cgroup root" predicted success exactly.
 
 **`--privileged` is about hardened systemd units, not Nomad.** `valkey-server`,
-`mysqlrouter` and AlmaLinux 10's `valkey@default` set `PrivateTmp=`/`ProtectSystem=`
-and need `CAP_SYS_ADMIN` to build a private mount namespace; without it they fail with
+`mysqlrouter` and `valkey@default` set `PrivateTmp=`/`ProtectSystem=` and need
+`CAP_SYS_ADMIN` to build a private mount namespace; without it they fail with
 `status=217/USER` or `226/NAMESPACE`. Granting only `CAP_SYS_ADMIN` instead of full
-`--privileged` was tried and is worse. Oracle Linux is deliberately left unprivileged:
-it does not need it, and granting it reproducibly broke `pmm-admin add mysql` there.
+`--privileged` was tried and is worse.
+
+**`ol8` and `ol9` must stay unprivileged.** They do not need it, and it actively
+breaks them — twice over. It used to break `pmm-admin add mysql`; that turned out to be
+the host AppArmor profile (see above) and is fixed. Running them privileged was then
+retried and still fails, now in a different place: `sudo` stops working inside the
+container (`PAM account management error: Authentication service cannot retrieve
+authentication info`) and the play dies at *Change Postgresql Password*. More privilege
+is not automatically safer — re-verify every OS after any change here.
 
 **PMM Server is mirrored into GHCR once per run.** A 72-cell run would otherwise cost
 72 Docker Hub pulls against a 100-per-6-hours limit shared with every other GitHub

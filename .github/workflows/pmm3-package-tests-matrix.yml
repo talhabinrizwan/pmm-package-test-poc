@@ -54,7 +54,8 @@ on:
         description: 'PMM Server admin password'
         default: 'pmm3admin!'
       git_branch:
-        description: 'Tag or branch of percona/pmm-qa'
+        description: 'Tag or branch of percona/pmm-qa. Ignored when this workflow
+          runs inside percona/pmm-qa itself, where the triggering commit is used.'
         default: 'main'
       client_image_tag:
         description: 'Prebuilt image tag. Use a YYYY-MM-DD tag to roll back.'
@@ -252,12 +253,22 @@ jobs:
           # Check the client can actually get there; a wrong public address breaks it.
           sudo podman exec client bash -c "timeout 5 bash -c '</dev/tcp/${GATEWAY}/4647'"
 
-      - name: Check out percona/pmm-qa in the client
-        env:
-          GIT_BRANCH: ${{ inputs.git_branch }}
+      # Checked out on the runner and copied in, rather than cloned inside the
+      # container. The ref matters: when this workflow lives in percona/pmm-qa it
+      # uses the commit that triggered the run, so a pull request touching a
+      # playbook is tested against its own change instead of whatever is on main.
+      # Anywhere else it falls back to the git_branch input.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: percona/pmm-qa
+          ref: ${{ github.repository == 'percona/pmm-qa' && github.sha || inputs.git_branch }}
+          path: pmm-qa
+          persist-credentials: false
+
+      - name: Copy pmm-qa into the client
         run: |
-          sudo podman exec client git clone --depth 1 --branch "$GIT_BRANCH" \
-            https://github.com/percona/pmm-qa /root/pmm-qa
+          sudo podman cp pmm-qa client:/root/pmm-qa
+          sudo podman exec client sh -c 'ls /root/pmm-qa/package_tests >/dev/null'
 
       - name: Run ${{ matrix.test }}
         env:

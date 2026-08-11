@@ -56,6 +56,11 @@ Inputs mirror the Jenkins job parameters one-for-one: `pmm_server_image`
 > them with `experimental` or `testing` — this is why Jenkins defaults to
 > `experimental`. The other six playbooks are happy either way.
 
+The playbook is checked out on the runner and copied into the container. When this
+workflow runs **inside `percona/pmm-qa`** it uses the commit that triggered the run,
+so a pull request touching a playbook is tested against its own change rather than
+against `main`; the `git_branch` input is only used elsewhere.
+
 Results land as a pass/fail grid in the run summary. Failed cells attach their full
 `ansible -vvv` output as a `logs-<os>-<test>` artifact.
 
